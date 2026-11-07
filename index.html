@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Weight-Space Programming in the browser: an LLM edits a WebGPU neural network through tools." />
+    <title>wsp-kit</title>
+    <link rel="stylesheet" href="./app/style.css" />
+  </head>
+  <body>
+    <header class="top">
+      <h1>wsp-kit <span class="sub">Weight-Space Programming</span></h1>
+      <div class="badges">
+        <span id="backend-badge" class="badge">no backend</span>
+        <span id="model-badge" class="badge">no network</span>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="side">
+        <section class="panel">
+          <h2>Network</h2>
+          <label>Source
+            <select id="source"></select>
+          </label>
+          <p id="source-desc" class="hint"></p>
+          <div id="seed-options" class="grid2" hidden>
+            <label>Width <input id="seed-dim" type="number" value="64" min="8" step="8" /></label>
+            <label>Layers <input id="seed-layers" type="number" value="2" min="1" max="32" /></label>
+            <label>Heads <input id="seed-heads" type="number" value="0" min="0" max="64" /></label>
+            <label>MLP width <input id="seed-hidden" type="number" value="0" min="0" /></label>
+            <p class="hint span2">0 heads and 0 MLP width is a zero-capacity seed: only embeddings and a classifier. Ask the architect to graft the rest.</p>
+          </div>
+          <div id="file-options" hidden>
+            <label>Model (.bin or .wspk) <input id="file-model" type="file" accept=".bin,.wspk" /></label>
+            <label>Tokenizer (.bin) <input id="file-tokenizer" type="file" accept=".bin" /></label>
+          </div>
+          <label class="row"><input id="use-cpu" type="checkbox" /> Use the CPU reference instead of WebGPU</label>
+          <button id="load" class="primary">Load network</button>
+          <progress id="load-progress" max="1" value="0" hidden></progress>
+          <p id="load-status" class="hint" role="status"></p>
+        </section>
+
+        <section class="panel">
+          <h2>Architect</h2>
+          <label>Provider
+            <select id="provider">
+              <option value="anthropic">Anthropic (Claude)</option>
+              <option value="openrouter">OpenRouter</option>
+              <option value="gemini">Google Gemini</option>
+              <option value="llamacpp">llama.cpp (local)</option>
+            </select>
+          </label>
+          <label>Model <input id="llm-model" list="llm-models" autocomplete="off" spellcheck="false" /></label>
+          <datalist id="llm-models"></datalist>
+          <button id="openrouter-free" class="small" hidden>List OpenRouter models with tool support (free first)</button>
+          <label id="base-url-row" hidden>Server URL <input id="base-url" spellcheck="false" /></label>
+          <label id="effort-row">Effort
+            <select id="effort">
+              <option>low</option><option>medium</option><option selected>high</option><option>xhigh</option><option>max</option>
+            </select>
+          </label>
+          <label id="key-row">API key
+            <input id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your key" />
+          </label>
+          <label id="persist-row">Keep the key
+            <select id="key-persist">
+              <option value="memory">in memory: forgotten on refresh</option>
+              <option value="session">for this tab (until it closes)</option>
+              <option value="local">on this device</option>
+            </select>
+          </label>
+          <div class="row">
+            <button id="key-save">Use key</button>
+            <button id="key-clear" class="ghost">Forget key</button>
+          </div>
+          <p id="key-status" class="hint"></p>
+          <p class="hint">Keys go only from this browser to the provider. They are never saved in checkpoints or exports.</p>
+        </section>
+
+        <section class="panel">
+          <h2>Checkpoints <span id="store-kind" class="hint"></span></h2>
+          <div class="row">
+            <input id="ckpt-id" placeholder="checkpoint id" spellcheck="false" />
+            <button id="ckpt-save">Save</button>
+          </div>
+          <ul id="ckpt-list" class="ckpts"></ul>
+          <button id="export" class="small">Download network (.wspk)</button>
+        </section>
+      </aside>
+
+      <section class="chat">
+        <div id="transcript" class="transcript" aria-live="polite">
+          <div class="empty">
+            <p>Load a network, add a key, then say what you want in plain words, for example:</p>
+            <ul>
+              <li>“Give me an overview of this network and find any dead neurons.”</li>
+              <li>“The model keeps saying ‘Lily’. Find the neurons behind that and prune them, without hurting other stories.”</li>
+              <li>“Add 16 MLP neurons to layer 2 and make it more likely to continue ‘Once upon a’ with ‘ time’.”</li>
+            </ul>
+          </div>
+        </div>
+        <form id="composer" class="composer">
+          <textarea id="message" rows="3" placeholder="Tell the architect what to change…"></textarea>
+          <div class="composer-actions">
+            <button id="send" class="primary" type="submit">Send</button>
+            <button id="stop" type="button" hidden>Stop</button>
+            <button id="clear-chat" type="button" class="ghost">New conversation</button>
+          </div>
+        </form>
+        <details class="playground">
+          <summary>Playground: run the network yourself</summary>
+          <div class="row">
+            <input id="play-prompt" value="Once upon a time" spellcheck="false" />
+            <button id="play-run">Generate</button>
+          </div>
+          <pre id="play-out"></pre>
+        </details>
+      </section>
+    </main>
+    <script type="module" src="./app/main.ts"></script>
+  </body>
+</html>

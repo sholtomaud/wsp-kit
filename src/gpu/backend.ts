@@ -359,6 +359,12 @@ export class WebGpuBackend implements Backend {
     await this.device.queue.onSubmittedWorkDone();
   }
 
+  destroy() {
+    for (const t of this.tensors.values()) t.buffer.destroy();
+    this.tensors.clear();
+    this.device.destroy();
+  }
+
   createRunner(config: ModelConfig): Runner {
     return new GpuRunner(this, config);
   }

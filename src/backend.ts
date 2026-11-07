@@ -95,6 +95,8 @@ export interface Backend {
   createRunner(config: ModelConfig): Runner;
   /** Resolves when all queued work has finished. */
   flush(): Promise<void>;
+  /** Releases every tensor (and the GPU device). */
+  destroy?(): void;
 }
 
 export const fullRegion = (shape: Shape): Region => ({ rowStart: 0, rowEnd: shape[0], colStart: 0, colEnd: shape[1] });

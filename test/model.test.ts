@@ -12,7 +12,7 @@ test('BPE merges by score, with a dummy prefix and byte fallback', () => {
   assert.deepEqual(ids.map((i) => tok.pieces[i]), ['<s>', ' hello', ' cat']);
   assert.equal(tok.decode(ids), 'hello cat');
   const emoji = tok.encode('é');
-  assert.ok(emoji.slice(2).every((i) => /^<0x/.test(tok.pieces[i])), 'unknown characters fall back to bytes');
+  assert.ok(emoji.slice(2).every((i) => tok.pieces[i].startsWith('<0x')), 'unknown characters fall back to bytes');
   assert.equal(tok.decode(emoji), 'é');
 });
 

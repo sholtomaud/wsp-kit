@@ -7,7 +7,7 @@
  */
 import { PCG_WGSL } from '../model/random.ts';
 
-const STEP = /* wgsl */ `struct Step { token: u32, pos: u32, target: i32, track: u32 }`;
+const STEP = /* wgsl */ `struct Step { token: u32, pos: u32, goal: i32, track: u32 }`;
 
 export const KERNELS = {
   fill: /* wgsl */ `
@@ -300,7 +300,7 @@ struct P { vocab: u32 }
 var<workgroup> red: array<f32, 256>;
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_index) i: u32) {
-  if (step.target < 0) { return; }
+  if (step.goal < 0) { return; }
   var mx = -3.4e38;
   for (var j = i; j < p.vocab; j += 256u) { mx = max(mx, logits[j]); }
   red[i] = mx;
@@ -320,7 +320,7 @@ fn main(@builtin(local_invocation_index) i: u32) {
     workgroupBarrier();
   }
   if (i == 0u) {
-    loss[0] = loss[0] - (logits[u32(step.target)] - m - log(red[0]));
+    loss[0] = loss[0] - (logits[u32(step.goal)] - m - log(red[0]));
     loss[1] = loss[1] + 1.0;
   }
 }`,
