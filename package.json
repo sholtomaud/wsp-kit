@@ -1,0 +1,32 @@
+{
+  "name": "wsp-kit",
+  "version": "0.1.0",
+  "description": "Browser-native Weight-Space Programming: an LLM edits a WebGPU neural network through tools.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "dev": "vite --host",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "node --test 'test/**/*.test.ts'",
+    "typecheck": "tsc -p .",
+    "lint": "oxlint src test e2e app",
+    "e2e": "playwright test --trace off"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.6.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@types/node": "^26.6.6",
+    "oxlint": "^1.92.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.6"
+  }
+}
