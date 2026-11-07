@@ -6,13 +6,19 @@
 import type { WSP } from '../wsp.ts';
 import { S, type Schema } from './schema.ts';
 
+export interface ToolContext {
+  signal?: AbortSignal;
+  /** A one-line status for long-running tools. */
+  progress?: (text: string) => void;
+}
+
 export interface ToolDef {
   name: string;
   description: string;
   input: Schema;
   /** Changes weights: the harness checkpoints first so the change can be undone. */
   mutates?: boolean;
-  run(wsp: WSP, input: Record<string, any>): Promise<unknown> | unknown;
+  run(wsp: WSP, input: Record<string, any>, ctx: ToolContext): Promise<unknown> | unknown;
 }
 
 const target = S.string('Tensor name, e.g. "layer_3.mlp.gate" (see model_overview for the list).');
@@ -174,24 +180,65 @@ export const TOOLS: ToolDef[] = [
   {
     name: 'mutate_micro_train',
     description:
-      'Gradient-free local refinement of ONE tensor (the rest of the network is frozen): a (1+1) evolution strategy that adds seeded noise on the GPU and keeps it only when the loss on texts drops. No backprop. Best on small tensors or a row range.',
+      'The intern: real backpropagation with AdamW in WebGPU, updating ONLY the targets you name; every other weight is frozen. Targets are tensor names, layer prefixes ("layer_1" = all its tensors), "all", or blocks of one tensor via row/col bounds (e.g. new MLP neurons 16–31 of layer 1: mlp.gate rows 16–32, mlp.up rows 16–32, mlp.down cols 16–32). Trains on a saved dataset (dataset_write) or inline texts; each text is a separate example (BOS…EOS), cut into windows. Returns loss before/after, chance-level loss, and a trajectory. Typical: lr 1e-3–1e-2, a few hundred steps; check with eval_run after.',
     mutates: true,
     input: S.object(
       {
-        target,
-        texts: texts('Texts whose loss should fall.'),
-        steps: S.integer('1–500.'),
-        row_start: S.integer('Restrict to rows [row_start, row_end).'),
-        row_end: S.integer(),
-        sigma: S.number('Initial noise as a fraction of the tensor std (default 0.05).'),
+        targets: S.array(
+          S.object(
+            {
+              tensor: S.string('Tensor name, layer prefix like "layer_1", or "all".'),
+              row_start: S.integer(),
+              row_end: S.integer('Exclusive.'),
+              col_start: S.integer(),
+              col_end: S.integer('Exclusive.'),
+            },
+            ['tensor']
+          )
+        ),
+        dataset: S.string('Name of a dataset saved with dataset_write.'),
+        texts: texts('Inline training texts (instead of dataset).'),
+        steps: S.integer('Optimizer steps, 1–20000.'),
+        lr: S.number('AdamW learning rate (default 0.003).'),
+        batch_size: S.integer('Windows per step (default 8, max 64).'),
+        weight_decay: S.number('Default 0.'),
+        window: S.integer('Max tokens per training window (default min(context, 256)).'),
       },
-      ['target', 'texts', 'steps']
+      ['targets', 'steps']
     ),
-    run: (wsp, i) =>
-      wsp.mutate.microTrain(i.target, i.texts, i.steps, {
-        rows: i.row_start !== undefined && i.row_end !== undefined ? [i.row_start, i.row_end] : undefined,
-        sigma: i.sigma,
-      }),
+    run: (wsp, i, ctx) => {
+      if (!i.dataset && !i.texts?.length) throw new Error('Give a dataset name or texts');
+      return wsp.mutate.microTrain(i.targets, i.dataset ?? i.texts, i.steps, {
+        lr: i.lr,
+        batchSize: i.batch_size,
+        weightDecay: i.weight_decay,
+        window: i.window,
+        signal: ctx.signal,
+        onProgress: ctx.progress,
+      });
+    },
+  },
+  {
+    name: 'dataset_write',
+    description:
+      'Saves training texts under a name (kept in the browser across reloads). You are the teacher: write many varied, high-quality examples in exactly the format you want the student to produce. Use append to build a large dataset over several calls.',
+    input: S.object(
+      { name: S.string('Letters, digits, . _ -'), texts: texts('One training example per entry.'), append: S.boolean('Add to an existing dataset.') },
+      ['name', 'texts']
+    ),
+    run: (wsp, i) => wsp.data.write(i.name, i.texts, i.append ?? false),
+  },
+  {
+    name: 'dataset_list',
+    description: 'Lists saved datasets with their sizes.',
+    input: S.object({}),
+    run: (wsp) => wsp.data.list(),
+  },
+  {
+    name: 'dataset_sample',
+    description: 'Reads a few texts from a saved dataset.',
+    input: S.object({ name: S.string(), start: S.integer(), count: S.integer('Default 5, max 50.') }, ['name']),
+    run: (wsp, i) => wsp.data.sample(i.name, i.start ?? 0, i.count ?? 5),
   },
   {
     name: 'state_checkpoint',

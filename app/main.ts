@@ -118,6 +118,7 @@ $('load').addEventListener('click', async () => {
     const c = wsp.config;
     setStatus(status, `Loaded ${loaded.id}: ${formatCount(parameterCount(c))} parameters, ${c.layers.length} layers, vocabulary ${c.vocabSize}.`, 'ok');
     await refreshCheckpoints();
+    await refreshDatasets();
   } catch (e) {
     setStatus(status, (e as Error).message, 'error');
     console.error(e);
@@ -315,6 +316,11 @@ function render(e: AgentEvent) {
       transcript.append(d);
       break;
     }
+    case 'tool_progress': {
+      const d = pendingTools.get(e.call.id);
+      if (d) d.querySelector('.meta')!.textContent = e.text;
+      break;
+    }
     case 'tool_result': {
       const d = pendingTools.get(e.call.id);
       if (!d) break;
@@ -323,6 +329,7 @@ function render(e: AgentEvent) {
       d.querySelector('.meta')!.textContent = `${e.ms} ms${e.checkpoint ? ` · saved ${e.checkpoint}` : ''}${e.result.isError ? ` · ${e.result.content.slice(0, 100)}` : ''} ${summarizeInput(e.call.input)}`;
       d.querySelector('.result')!.textContent = pretty(e.result.content);
       if (e.checkpoint) void refreshCheckpoints();
+      if (e.call.name.startsWith('dataset_')) void refreshDatasets();
       break;
     }
     case 'stopped':
@@ -427,6 +434,28 @@ $('export').addEventListener('click', async () => {
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 });
+
+// ------------------------------------------------------------- datasets
+
+async function refreshDatasets() {
+  const list = $('dataset-list');
+  if (!wsp) return list.replaceChildren();
+  const items = await wsp.data.list();
+  $('dataset-empty').hidden = items.length > 0;
+  list.replaceChildren(
+    ...items.map((d) => {
+      const li = document.createElement('li');
+      li.innerHTML = '<span class="name"></span><span class="size"></span><button class="small ghost del" aria-label="Delete">✕</button>';
+      li.querySelector('.name')!.textContent = d.name;
+      li.querySelector('.size')!.textContent = `${d.texts} texts`;
+      li.querySelector('.del')!.addEventListener('click', async () => {
+        await wsp!.data.delete(d.name);
+        void refreshDatasets();
+      });
+      return li;
+    })
+  );
+}
 
 // ------------------------------------------------------------- playground
 

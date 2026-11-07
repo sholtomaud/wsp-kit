@@ -186,3 +186,48 @@ test('each provider shows only its own settings', async ({ page }) => {
   expect(await visible()).toEqual({ url: true, effort: false, openrouter: false });
   await expect(page.locator('#key-status')).toContainText('No key needed');
 });
+
+test('OpenRouter architect writes a dataset and trains the network on the GPU', async ({ page }) => {
+  const bodies: any[] = [];
+  const replies = [
+    {
+      content: 'Writing data, then training.',
+      tool_calls: [
+        { id: 'c1', type: 'function', function: { name: 'dataset_write', arguments: JSON.stringify({ name: 'greet', texts: ['User: hi\nBot: hello!', 'User: hi\nBot: hello!'] }) } },
+        { id: 'c2', type: 'function', function: { name: 'mutate_micro_train', arguments: JSON.stringify({ targets: [{ tensor: 'all' }], dataset: 'greet', steps: 40, lr: 0.02, batch_size: 2 }) } },
+      ],
+    },
+    { content: 'Trained.', tool_calls: [] },
+  ];
+  await page.route('https://openrouter.ai/api/v1/chat/completions', async (route) => {
+    bodies.push(route.request().postDataJSON());
+    const m = replies[bodies.length - 1];
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      headers: { 'access-control-allow-origin': '*' },
+      body: JSON.stringify({ model: 'anthropic/claude-haiku-5.5', choices: [{ finish_reason: m.tool_calls.length ? 'tool_calls' : 'stop', message: { role: 'assistant', ...m } }] }),
+    });
+  });
+  await page.selectOption('#source', 'seed');
+  await page.fill('#seed-dim', '32');
+  await page.fill('#seed-layers', '1');
+  await page.fill('#seed-heads', '2');
+  await page.fill('#seed-hidden', '32');
+  await page.click('#load');
+  await expect(page.locator('#load-status')).toContainText('Loaded seed-');
+  await page.selectOption('#provider', 'openrouter');
+  await page.fill('#llm-model', 'anthropic/claude-haiku-5.5');
+  await page.fill('#api-key', 'or-test');
+  await page.click('#key-save');
+  await page.fill('#message', 'teach it to say hello');
+  await page.click('#send');
+  await expect(page.locator('.msg.assistant').last()).toContainText('Trained.', { timeout: 60_000 });
+  await expect(page.locator('.tool .name')).toHaveText(['dataset_write', 'mutate_micro_train']);
+  await expect(page.locator('.tool.err')).toHaveCount(0);
+  await expect(page.locator('#dataset-list')).toContainText('greet');
+  const result = JSON.parse(bodies[1].messages.at(-1).content);
+  expect(result.method).toContain('backpropagation');
+  expect(result.lossAfter).toBeLessThan(result.lossBefore / 2);
+  expect(result.rollback).toContain('auto-1');
+});

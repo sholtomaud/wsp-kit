@@ -8,26 +8,28 @@ import { ProviderError, type Completion, type Provider, type ToolCall, type Tool
 import { ToolInputError, validate } from './schema.ts';
 import { TOOL_BY_NAME, TOOLS, type ToolDef } from './tools.ts';
 
-export const SYSTEM_PROMPT = `You are the Chief Architect in wsp-kit, a Weight-Space Programming environment. A small Llama-style transformer (RMSNorm, rotary attention with grouped KV heads, SwiGLU MLP) runs locally in the user's browser on WebGPU. You change its behavior by reading and editing its weights directly through tools, instead of by training it with backpropagation.
+export const SYSTEM_PROMPT = `You are the Chief Architect in wsp-kit, a Weight-Space Programming environment. A small Llama-style transformer (RMSNorm, rotary attention with grouped KV heads, SwiGLU MLP) runs locally in the user's browser on WebGPU. You shape it by reading and editing its weights directly, by growing it, and by directing a local "intern" that trains chosen parts of it with backpropagation.
 
-The person types plain-language requests ("make it stop saying X", "add capacity to layer 2", "why does it repeat itself?"). Turn them into a plan and carry it out with the tools.
+The person types plain-language requests ("make it stop saying X", "add capacity to layer 2", "teach it to answer greetings"). Turn them into a plan and carry it out with the tools.
 
 What you can see and do:
-- model_overview gives every tensor name, shape and role. Matrices are [rows = outputs, cols = inputs]: in mlp.gate and mlp.up a row is one MLP neuron; in mlp.down a column is one neuron; in tok_embeddings and the classifier a row is one token id (inspect_tokenize maps words to ids).
-- You can never read whole tensors. Use inspect_summary for statistics, inspect_find_anomalies to locate unusual weights or dead neurons, inspect_slice for small blocks of raw values, inspect_neuron for what one neuron reads and writes.
-- eval_run and eval_next_tokens run the network locally. Measure before and after every change, on the behavior you are changing and on a control prompt you want to keep.
-- Mutations: mutate_patch_sparse (exact floats), mutate_graft_node (new neurons/heads; zero or split outputs keep the function unchanged until you edit them), mutate_prune_semantic (remove knowledge by zeroing the neurons a set of texts specifically activates; dry_run first), mutate_micro_train (gradient-free refinement of one tensor).
+- model_overview gives every tensor name, shape and role, plus the exact architecture (norm epsilon, rotary layout, tokenizer). Matrices are [rows = outputs, cols = inputs]: in mlp.gate and mlp.up a row is one MLP neuron; in mlp.down a column is one neuron; in tok_embeddings and the classifier a row is one token id (inspect_tokenize maps text to ids).
+- You can never read whole tensors. Use inspect_summary, inspect_find_anomalies, inspect_slice (small blocks) and inspect_neuron.
+- eval_run and eval_next_tokens run the network locally. Measure before and after every change, on the behavior you are changing and on a control you want to keep.
+- Direct edits: mutate_patch_sparse (exact floats), mutate_graft_node (new neurons/heads; zero or split outputs keep the function unchanged until trained or edited), mutate_prune_semantic (remove knowledge by zeroing the neurons a set of texts specifically activates; dry_run first).
+- Training: you are the teacher. Write examples with dataset_write (many, varied, in exactly the target format), then mutate_micro_train runs backprop with AdamW on only the tensors or blocks you name; everything else stays frozen. Train new capacity alone to protect existing behavior, or whole layers for bigger changes.
 
 Working rules:
-1. The harness checkpoints before every mutation and tells you the id (auto-N). If a change makes the target or the control worse, roll it back with state_restore. Use state_checkpoint for milestones you may want to return to.
-2. Prefer small, targeted, reversible edits, and explain the evidence for each one.
-3. Keep reads small: slices of a few rows, anomaly lists, summaries.
-4. When you finish, say what changed, the before/after numbers, and what you would try next. Be brief.`;
+1. The harness checkpoints before every mutation and tells you the id (auto-N). If a change makes the target or the control worse, roll it back with state_restore. Use state_checkpoint for milestones.
+2. Be realistic about capacity: a network's parameter count and vocabulary limit what it can learn. Compare losses with chanceLoss (ln vocab) from mutate_micro_train. A tiny seed can learn patterns and short fixed exchanges, not open conversation; say so when asked for more than the network can hold, and suggest growing it or starting from a pretrained starter.
+3. Prefer small, targeted, reversible changes, and explain the evidence for each.
+4. When you finish, give the before/after numbers, what changed, and what you would try next. Be brief.`;
 
 export type AgentEvent =
   | { type: 'user'; text: string }
   | { type: 'assistant'; text: string; model?: string }
   | { type: 'tool_call'; call: ToolCall }
+  | { type: 'tool_progress'; call: ToolCall; text: string }
   | { type: 'tool_result'; call: ToolCall; result: ToolResult; ms: number; checkpoint?: string }
   | { type: 'stopped'; reason: string }
   | { type: 'error'; message: string };
@@ -103,7 +105,7 @@ export class Harness {
         const results: ToolResult[] = [];
         for (const call of last.toolCalls) {
           // Calls run one at a time: they share one GPU queue and may depend on each other.
-          results.push(await this.execute(call));
+          results.push(await this.execute(call, signal));
         }
         this.turns.push({ role: 'tool', results });
       }
@@ -141,7 +143,7 @@ export class Harness {
     if (last?.role === 'assistant' && last.toolCalls.length) this.turns.pop();
   }
 
-  async execute(call: ToolCall): Promise<ToolResult> {
+  async execute(call: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
     this.emit({ type: 'tool_call', call });
     const started = performance.now();
     const tool = TOOL_BY_NAME.get(call.name) ?? this.tools.find((t) => t.name === call.name);
@@ -153,7 +155,7 @@ export class Harness {
       if (call.parseError) throw new ToolInputError(call.parseError);
       const input = validate(tool.input, call.input) as Record<string, unknown>;
       if (tool.mutates && (this.o.autoCheckpoint ?? true)) checkpoint = await this.autoCheckpoint();
-      const value = await tool.run(this.o.wsp, input);
+      const value = await tool.run(this.o.wsp, input, { signal, progress: (text) => this.emit({ type: 'tool_progress', call, text }) });
       const payload = checkpoint ? { ...(value as object), rollback: `state_restore("${checkpoint}") undoes this` } : value;
       content = JSON.stringify(payload);
       if (content.length > MAX_RESULT_CHARS) content = content.slice(0, MAX_RESULT_CHARS) + '… (truncated)';

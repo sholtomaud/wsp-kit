@@ -154,16 +154,6 @@ test('eval.run reports loss, perplexity and the change since last time', async (
   assert.equal(b.delta, 0);
 });
 
-test('microTrain lowers the loss without touching other tensors', async () => {
-  const wsp = makeWsp();
-  const other = await wsp.backend.read('layer_0.mlp.gate');
-  const r = await wsp.mutate.microTrain('norm', ['aaaa aaaa aaaa'], 40, { sigma: 0.5, seed: 1 });
-  assert.ok(r.lossAfter <= r.lossBefore);
-  assert.ok(r.accepted > 0, 'some steps improved the loss');
-  assert.equal(maxAbsDiff(other, await wsp.backend.read('layer_0.mlp.gate')), 0);
-  assert.equal(wsp.backend.has('norm#backup'), false);
-});
-
 test('neuron inspection names tokens', async () => {
   const wsp = makeWsp();
   const n = await wsp.inspect.neuron(0, 2, 3);

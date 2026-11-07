@@ -2,8 +2,9 @@
  * The CPU reference: the same operations as the WebGPU backend, as plain
  * loops over Float32Arrays. The forward pass follows llama2.c's run.c.
  */
-import { checkRegion, type Backend, type Fill, type Hits, type Region, type RunOptions, type Runner, type Stats } from '../backend.ts';
+import { checkRegion, type Backend, type TrainTarget, type Fill, type Hits, type Region, type RunOptions, type Runner, type Stats } from '../backend.ts';
 import { gaussian } from '../model/random.ts';
+import { CpuTrainer } from './trainer.ts';
 import { classifierName, kvDim, type ModelConfig, type Shape } from '../model/types.ts';
 
 interface Tensor {
@@ -179,6 +180,10 @@ export class CpuBackend implements Backend {
 
   createRunner(config: ModelConfig): Runner {
     return new CpuRunner(this, config);
+  }
+
+  createTrainer(config: ModelConfig, length: number, targets: TrainTarget[]) {
+    return new CpuTrainer(this, config, length, targets);
   }
 }
 

@@ -46,7 +46,6 @@ export class MemoryStore implements CheckpointStore {
   }
 }
 
-const EXT = '.wspk';
 
 /**
  * Safari has long lacked FileSystemFileHandle.createWritable in the window;
@@ -74,9 +73,11 @@ onmessage = async (e) => {
 export class OpfsStore implements CheckpointStore {
   readonly kind = 'opfs' as const;
   private readonly path: string[];
+  private readonly ext: string;
 
-  constructor(path: string[] = ['wsp-kit', 'checkpoints']) {
+  constructor(path: string[] = ['wsp-kit', 'checkpoints'], ext = '.wspk') {
     this.path = path;
+    this.ext = ext;
   }
 
   static available(): boolean {
@@ -90,7 +91,7 @@ export class OpfsStore implements CheckpointStore {
   }
 
   async save(id: string, data: ArrayBuffer) {
-    const name = checkId(id) + EXT;
+    const name = checkId(id) + this.ext;
     const dir = await this.dir();
     const file = await dir.getFileHandle(name, { create: true });
     if ('createWritable' in file && typeof file.createWritable === 'function') {
@@ -106,7 +107,7 @@ export class OpfsStore implements CheckpointStore {
     const dir = await this.dir();
     let file: FileSystemFileHandle;
     try {
-      file = await dir.getFileHandle(checkId(id) + EXT);
+      file = await dir.getFileHandle(checkId(id) + this.ext);
     } catch {
       throw new Error(`No checkpoint "${id}"`);
     }
@@ -118,16 +119,16 @@ export class OpfsStore implements CheckpointStore {
     const out: CheckpointInfo[] = [];
     // entries() is async-iterable in every OPFS engine; the DOM typings lag.
     for await (const [name, handle] of (dir as unknown as { entries(): AsyncIterable<[string, FileSystemHandle]> }).entries()) {
-      if (handle.kind !== 'file' || !name.endsWith(EXT)) continue;
+      if (handle.kind !== 'file' || !name.endsWith(this.ext)) continue;
       const f = await (handle as FileSystemFileHandle).getFile();
-      out.push({ id: name.slice(0, -EXT.length), bytes: f.size, savedAt: f.lastModified });
+      out.push({ id: name.slice(0, -this.ext.length), bytes: f.size, savedAt: f.lastModified });
     }
     return out.sort((a, b) => b.savedAt - a.savedAt);
   }
 
   async delete(id: string) {
     const dir = await this.dir();
-    await dir.removeEntry(checkId(id) + EXT).catch(() => {});
+    await dir.removeEntry(checkId(id) + this.ext).catch(() => {});
   }
 }
 
@@ -151,6 +152,6 @@ function writeInWorker(dir: string[], name: string, data: ArrayBuffer): Promise<
   });
 }
 
-export function defaultStore(path?: string[]): CheckpointStore {
-  return OpfsStore.available() ? new OpfsStore(path) : new MemoryStore();
+export function defaultStore(path?: string[], ext?: string): CheckpointStore {
+  return OpfsStore.available() ? new OpfsStore(path, ext) : new MemoryStore();
 }

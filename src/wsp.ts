@@ -5,10 +5,12 @@
  * a bounded grid, a ranked list of coordinates. Nothing hands back a whole
  * tensor, and every write goes through a shader in the backend.
  */
-import { fullRegion, type Backend, type Region } from './backend.ts';
+import { checkRegion, fullRegion, type Backend, type Region, type Sequence, type TrainTarget } from './backend.ts';
 import { parseWspk, serializeWspk } from './model/formats.ts';
 import { Model } from './model/model.ts';
 import { checkId, defaultStore, type CheckpointStore } from './state/store.ts';
+import { Datasets } from './state/datasets.ts';
+import { rng } from './model/random.ts';
 import { classifierName, cloneConfig, parameterCount, type ModelConfig } from './model/types.ts';
 
 export interface TensorSummary {
@@ -65,12 +67,28 @@ export interface PruneOptions {
   dryRun?: boolean;
 }
 
+/**
+ * What training may change: a tensor name, a layer prefix ("layer_2" for all
+ * its tensors), "all", or a block of one tensor. Bounds are half-open and
+ * default to the whole tensor.
+ */
+export type TargetSpec =
+  | string
+  | { tensor: string; row_start?: number; row_end?: number; col_start?: number; col_end?: number };
+
 export interface MicroTrainOptions {
-  /** Restrict the perturbation to these rows. */
-  rows?: [number, number];
-  /** Initial perturbation, as a fraction of the tensor's std. Default 0.05. */
-  sigma?: number;
+  /** AdamW learning rate. Default 3e-3. */
+  lr?: number;
+  /** Windows per step. Default 8. */
+  batchSize?: number;
+  weightDecay?: number;
+  /** Global gradient-norm clip. Default 1. */
+  clip?: number;
+  /** Longest training window, in tokens. Default min(context, 256). */
+  window?: number;
   seed?: number;
+  signal?: AbortSignal;
+  onProgress?: (text: string) => void;
 }
 
 export interface EvalOptions {
@@ -80,6 +98,7 @@ export interface EvalOptions {
 
 export interface WspOptions {
   store?: CheckpointStore;
+  datasets?: Datasets;
 }
 
 const r4 = (x: number) => (Number.isFinite(x) ? Number(x.toPrecision(4)) : x);
@@ -87,12 +106,14 @@ const r4 = (x: number) => (Number.isFinite(x) ? Number(x.toPrecision(4)) : x);
 export class WSP {
   readonly model: Model;
   readonly store: CheckpointStore;
+  readonly datasets: Datasets;
   private lastEval = new Map<string, number>();
   private seedCounter = 1;
 
   constructor(model: Model, options: WspOptions = {}) {
     this.model = model;
     this.store = options.store ?? defaultStore();
+    this.datasets = options.datasets ?? new Datasets();
   }
 
   get backend(): Backend {
@@ -157,6 +178,16 @@ export class WSP {
         classifier: classifierName(c),
         layers: c.layers.map((l, i) => ({ layer: i, heads: l.nHeads, headKv: l.headKv, mlpHidden: l.hidden })),
         tensors: this.model.specs().map((s) => ({ name: s.name, shape: s.shape, role: s.role })),
+        architecture: {
+          block: 'x += wo·Attention(RMSNorm(x)); x += down·(silu(gate·n) * (up·n)) with n = RMSNorm(x); logits = classifier·RMSNorm(x)',
+          rmsNormEps: c.normEps,
+          rotary: `applied to q and k after projection, on adjacent pairs (2i, 2i+1) within each head; angle = position / ${c.ropeTheta}^((2i mod headSize)/headSize)`,
+          attention: 'causal softmax(q·k / sqrt(headSize)); query head h reads KV head headKv[h]',
+          matrices: '[rows = outputs, cols = inputs]; y = W·x',
+          classifier: c.sharedClassifier ? 'tied: logits use tok_embeddings' : 'separate lm_head',
+        },
+        tokenizer: this.tokenizerInfo(),
+        training: 'mutate_micro_train runs real backpropagation with AdamW in WebGPU on the tensors or blocks you choose; everything else stays frozen.',
       };
     },
 
@@ -463,66 +494,108 @@ export class WSP {
     },
 
     /**
-     * Local refinement of one tensor without backpropagation: a (1+1)
-     * evolution strategy. Each step adds seeded Gaussian noise on the GPU,
-     * keeps it if the loss on `dataset` fell, and copies the backup back if
-     * not. The rest of the network is untouched (frozen).
+     * The "intern": real backpropagation with AdamW on the chosen tensors or
+     * blocks (everything else frozen), over a named dataset or a list of texts.
+     * Texts are cut into windows of at most `window` tokens.
      */
-    microTrain: async (targetModule: string, dataset: string[], steps: number, options: MicroTrainOptions = {}) => {
-      const spec = this.model.spec(targetModule);
-      if (!dataset.length) throw new Error('microTrain needs at least one text');
-      if (!(Number.isInteger(steps) && steps >= 1 && steps <= 500)) throw new RangeError('steps must be 1…500');
-      const region = options.rows
-        ? { rowStart: options.rows[0], rowEnd: options.rows[1], colStart: 0, colEnd: spec.shape[1] }
-        : fullRegion(spec.shape);
-      const encoded = dataset.map((t) => this.model.tokenizer.encode(t));
-      const loss = async () => {
-        let sum = 0;
-        let n = 0;
-        for (const tokens of encoded) {
-          const r = await this.model.nll(tokens.slice(0, 1), tokens.slice(1));
-          sum += r.loss * r.tokens;
-          n += r.tokens;
-        }
-        return n ? sum / n : NaN;
+    microTrain: async (targets: TargetSpec | TargetSpec[], dataset: string | string[], steps: number, options: MicroTrainOptions = {}) => {
+      if (!(Number.isInteger(steps) && steps >= 1 && steps <= 20000)) throw new RangeError('steps must be 1…20000');
+      const resolved = this.resolveTargets(Array.isArray(targets) ? targets : [targets]);
+      const texts = typeof dataset === 'string' ? await this.datasets.get(dataset) : dataset;
+      if (!texts.length) throw new Error('microTrain needs at least one text');
+      const windowLen = Math.min(options.window ?? 256, this.model.config.seqLen, 512);
+      const windows = this.windows(texts, windowLen);
+      if (!windows.length) throw new Error('The texts are too short to train on (each needs at least two tokens)');
+      const length = Math.max(...windows.map((w) => w.tokens.length));
+      const batchSize = Math.min(Math.max(1, options.batchSize ?? 8), 64);
+      const adam = {
+        lr: options.lr ?? 3e-3,
+        beta1: 0.9,
+        beta2: 0.95,
+        eps: 1e-8,
+        weightDecay: options.weightDecay ?? 0,
+        clip: options.clip ?? 1,
       };
-      const backup = `${targetModule}#backup`;
-      const be = this.backend;
-      let sigma = (options.sigma ?? 0.05) * ((await this.stdOf(targetModule)) || 0.02);
-      const seed = this.nextSeed(options.seed);
-      const start = await loss();
-      let best = start;
-      let accepted = 0;
-      const trajectory: number[] = [r4(start)];
-      await be.copy(targetModule, backup);
-      try {
-        for (let s = 0; s < steps; s++) {
-          await be.fill(targetModule, region, { kind: 'add_gaussian', std: sigma, seed: (seed + s * 7919) >>> 0 });
-          const l = await loss();
-          if (l < best) {
-            best = l;
-            accepted++;
-            await be.copy(targetModule, backup);
-            sigma *= 1.5;
-          } else {
-            await be.copy(backup, targetModule);
-            sigma *= 0.85;
-          }
-          trajectory.push(r4(best));
+      if (!(adam.lr > 0 && adam.lr < 1)) throw new RangeError('lr must be between 0 and 1');
+      const started = performance.now();
+      const trainer = this.backend.createTrainer(this.model.config, length, resolved);
+      const random = rng(this.nextSeed(options.seed));
+      const evalSet = windows.length > 64 ? sampleWithout(windows, 64, random) : windows;
+      const meanLoss = async () => {
+        let sum = 0;
+        let count = 0;
+        for (let i = 0; i < evalSet.length; i += 16) {
+          const r = await trainer.loss(evalSet.slice(i, i + 16));
+          sum += r.sum;
+          count += r.count;
         }
+        return sum / count;
+      };
+      let lossBefore = NaN;
+      let lossAfter = NaN;
+      const trajectory: number[] = [];
+      let done = 0;
+      let skipped = 0;
+      let tokens = 0;
+      let lastGradNorm = 0;
+      try {
+        lossBefore = await meanLoss();
+        const warmup = Math.min(20, Math.ceil(steps / 10));
+        let running = lossBefore;
+        let lastReport = performance.now();
+        for (let s = 0; s < steps; s++) {
+          if (options.signal?.aborted) break;
+          const batch = Array.from({ length: Math.min(batchSize, windows.length) }, () => windows[Math.floor(random() * windows.length)]);
+          const r = await trainer.accumulate(batch);
+          tokens += r.count;
+          // Linear warm-up, then cosine decay to 10%.
+          const progress = s < warmup ? (s + 1) / warmup : 0.1 + 0.9 * 0.5 * (1 + Math.cos((Math.PI * (s - warmup)) / Math.max(1, steps - warmup)));
+          const u = await trainer.update({ ...adam, lr: adam.lr * progress });
+          lastGradNorm = u.gradNorm;
+          if (u.skipped) skipped++;
+          running = 0.9 * running + 0.1 * (r.sum / Math.max(1, r.count));
+          done++;
+          if (done % Math.max(1, Math.ceil(steps / 20)) === 0 || done === steps) trajectory.push(r4(running));
+          if (options.onProgress && (done === 1 || performance.now() - lastReport > 500)) {
+            lastReport = performance.now();
+            options.onProgress(`step ${done}/${steps} · loss ${running.toFixed(3)}`);
+          }
+        }
+        lossAfter = await meanLoss();
       } finally {
-        be.free(backup);
+        trainer.destroy();
       }
+      const trainable = resolved.reduce((n, t) => n + (t.region.rowEnd - t.region.rowStart) * (t.region.colEnd - t.region.colStart), 0);
+      const seconds = (performance.now() - started) / 1000;
       return {
-        target: targetModule,
-        method: '(1+1)-ES, gradient-free; other tensors frozen',
-        steps,
-        accepted,
-        lossBefore: r4(start),
-        lossAfter: r4(best),
-        trajectory: trajectory.length > 21 ? trajectory.filter((_, i) => i % Math.ceil(trajectory.length / 20) === 0 || i === trajectory.length - 1) : trajectory,
+        method: 'AdamW with backpropagation; other tensors frozen',
+        targets: resolved.map((t) => ({ tensor: t.name, rows: [t.region.rowStart, t.region.rowEnd], cols: [t.region.colStart, t.region.colEnd] })),
+        trainableParameters: trainable,
+        windows: windows.length,
+        windowLength: length,
+        steps: done,
+        stoppedEarly: done < steps,
+        skippedNonFiniteSteps: skipped,
+        lossBefore: r4(lossBefore),
+        lossAfter: r4(lossAfter),
+        chanceLoss: r4(Math.log(this.model.config.vocabSize)),
+        trajectory,
+        lastGradNorm: r4(lastGradNorm),
+        tokensPerSecond: Math.round(tokens / Math.max(seconds, 1e-3)),
+        seconds: r4(seconds),
       };
     },
+  };
+
+  // ---------------------------------------------------------------- data
+
+  readonly data = {
+    /** Saves texts under a name (appending if asked), for microTrain. */
+    write: (name: string, texts: string[], append = false) => this.datasets.write(name, texts, append),
+    get: (name: string) => this.datasets.get(name),
+    list: () => this.datasets.list(),
+    sample: (name: string, start?: number, count?: number) => this.datasets.sample(name, start, count),
+    delete: (name: string) => this.datasets.delete(name),
   };
 
   // ---------------------------------------------------------------- eval
@@ -591,6 +664,60 @@ export class WSP {
     };
   }
 
+  /** Turns target specs into tensor blocks, checking every bound. */
+  resolveTargets(specs: TargetSpec[]): TrainTarget[] {
+    if (!specs.length) throw new Error('Name at least one tensor to train');
+    const names = this.model.specs().map((s) => s.name);
+    const out = new Map<string, TrainTarget>();
+    for (const spec of specs) {
+      const tensor = typeof spec === 'string' ? spec : spec.tensor;
+      const matched = tensor === 'all' ? names : names.includes(tensor) ? [tensor] : names.filter((n) => n.startsWith(tensor + '.'));
+      if (!matched.length) this.model.spec(tensor); // throws a helpful error
+      for (const name of matched) {
+        const shape = this.backend.shape(name);
+        let region = fullRegion(shape);
+        if (typeof spec !== 'string') {
+          if (matched.length > 1 && (spec.row_start ?? spec.row_end ?? spec.col_start ?? spec.col_end) !== undefined) {
+            throw new Error(`Row/column bounds need a single tensor, not "${tensor}"`);
+          }
+          region = {
+            rowStart: spec.row_start ?? 0,
+            rowEnd: spec.row_end ?? shape[0],
+            colStart: spec.col_start ?? 0,
+            colEnd: spec.col_end ?? shape[1],
+          };
+          checkRegion(shape, region, name);
+        }
+        if (out.has(name)) throw new Error(`${name} is named twice`);
+        if (region.rowEnd > region.rowStart && region.colEnd > region.colStart) out.set(name, { name, region });
+      }
+    }
+    if (!out.size) throw new Error('The targets select no parameters (empty tensors or blocks)');
+    return [...out.values()];
+  }
+
+  /** Each text as BOS-prefixed tokens, cut into next-token windows of at most `length`. */
+  private windows(texts: string[], length: number): Sequence[] {
+    const out: Sequence[] = [];
+    for (const text of texts) {
+      const ids = this.model.tokenizer.encode(text, { eos: true });
+      for (let i = 0; i + 1 < ids.length; i += length) {
+        const chunk = ids.slice(i, i + length + 1);
+        if (chunk.length < 2) break;
+        out.push({ tokens: chunk.slice(0, -1), targets: chunk.slice(1) });
+      }
+    }
+    return out;
+  }
+
+  private tokenizerInfo() {
+    const tok = this.model.tokenizer;
+    const byteLevel = tok.vocabSize === 259 && tok.pieces[3] === '<0x00>';
+    return byteLevel
+      ? { kind: 'byte-level', vocabSize: tok.vocabSize, special: { unk: 0, bos: 1, eos: 2 }, tokenId: 'UTF-8 byte + 3 (e.g. " " = 35, "\\n" = 13, "a" = 100)' }
+      : { kind: 'SentencePiece BPE (llama2.c)', vocabSize: tok.vocabSize, special: { unk: 0, bos: 1, eos: 2 }, note: 'pieces start with " " where a word starts; unknown characters fall back to <0xXX> byte pieces' };
+  }
+
   private async stdOf(name: string): Promise<number> {
     const s = await this.backend.stats(name);
     const n = s.count - s.nonFinite;
@@ -617,6 +744,15 @@ export class WSP {
   get config(): ModelConfig {
     return this.model.config;
   }
+}
+
+function sampleWithout<T>(items: T[], k: number, random: () => number): T[] {
+  const copy = [...items];
+  for (let i = 0; i < k; i++) {
+    const j = i + Math.floor(random() * (copy.length - i));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy.slice(0, k);
 }
 
 function fmt(x: number): string {

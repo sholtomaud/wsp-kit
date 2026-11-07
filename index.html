@@ -87,6 +87,12 @@
           <ul id="ckpt-list" class="ckpts"></ul>
           <button id="export" class="small">Download network (.wspk)</button>
         </section>
+
+        <section class="panel">
+          <h2>Datasets</h2>
+          <p id="dataset-empty" class="hint">None yet. The architect writes training texts here (dataset_write) for the intern to learn from.</p>
+          <ul id="dataset-list" class="ckpts"></ul>
+        </section>
       </aside>
 
       <section class="chat">
@@ -97,6 +103,7 @@
               <li>“Give me an overview of this network and find any dead neurons.”</li>
               <li>“The model keeps saying ‘Lily’. Find the neurons behind that and prune them, without hurting other stories.”</li>
               <li>“Add 16 MLP neurons to layer 2 and make it more likely to continue ‘Once upon a’ with ‘ time’.”</li>
+              <li>“Grow this seed and teach it to answer simple greetings. Write the training data yourself.”</li>
             </ul>
           </div>
         </div>
