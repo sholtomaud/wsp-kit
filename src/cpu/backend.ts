@@ -2,7 +2,7 @@
  * The CPU reference: the same operations as the WebGPU backend, as plain
  * loops over Float32Arrays. The forward pass follows llama2.c's run.c.
  */
-import { checkRegion, type Backend, type TrainTarget, type Fill, type Hits, type Region, type RunOptions, type Runner, type Stats } from '../backend.ts';
+import { checkRegion, type Backend, type TrainTarget, type TrainerOptions, type Fill, type Hits, type Region, type RunOptions, type Runner, type Stats } from '../backend.ts';
 import { gaussian } from '../model/random.ts';
 import { CpuTrainer } from './trainer.ts';
 import { classifierName, kvDim, type ModelConfig, type Shape } from '../model/types.ts';
@@ -182,8 +182,17 @@ export class CpuBackend implements Backend {
     return new CpuRunner(this, config);
   }
 
-  createTrainer(config: ModelConfig, length: number, targets: TrainTarget[]) {
-    return new CpuTrainer(this, config, length, targets);
+  createTrainer(config: ModelConfig, length: number, targets: TrainTarget[], options?: TrainerOptions) {
+    return new CpuTrainer(this, config, length, targets, options);
+  }
+
+  async addOuter(name: string, a: Float32Array, b: Float32Array, scale: number) {
+    const { shape, data } = this.get(name);
+    if (a.length !== shape[0] || b.length !== shape[1]) throw new Error(`${name}: outer product of ${a.length}×${b.length} for a ${shape[0]}×${shape[1]} tensor`);
+    for (let i = 0; i < shape[0]; i++) {
+      const s = scale * a[i];
+      for (let j = 0; j < shape[1]; j++) data[i * shape[1] + j] = Math.fround(data[i * shape[1] + j] + s * b[j]);
+    }
   }
 }
 

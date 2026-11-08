@@ -48,12 +48,20 @@ The *Playground* at the bottom runs the network directly, without an LLM.
 | `wsp.state.checkpoint/restore` (OPFS) | `src/wsp.ts`, `src/state/store.ts`; `.wspk` format in `src/model/formats.ts` |
 | `wsp.inspect.summary/slice/findAnomalies` | `src/wsp.ts`, plus `inspect.neuron` (logit lens) and `inspect.tokenize` |
 | `wsp.mutate.patchSparse/graftNode/pruneSemantic` | `src/wsp.ts` |
+| Computed edits: `wsp.mutate.insertAssociation`, `wsp.mutate.wireNeuron` | `src/computed.ts` (activation capture, layer gradient probe, rank-one `addOuter` kernel) |
 | `wsp.mutate.microTrain` (the intern) | `src/wsp.ts`; WGSL forward/backward/AdamW in `src/gpu/train-kernels.ts`, `src/gpu/trainer.ts`; CPU reference in `src/cpu/trainer.ts` |
 | Training data written by the Architect | `wsp.data.*`, `src/state/datasets.ts` (OPFS) |
 | `wsp.eval.run` | `src/wsp.ts` (greedy generation, loss, perplexity, delta since the last eval), plus `eval.nextTokens` |
 | String ids → GPU buffers (`"layer_3.mlp.gate"`) | `src/model/types.ts` (tensor naming), `Backend` in `src/backend.ts` |
 
 ### Design notes
+
+- **Computed edits come first.** The master says *what* should happen and *where*; wsp-kit works out the floats, with no training loop.
+  - `insertAssociation({ prompt, target, layer, preserve })` reads the network's own key at the end of the prompt (the input to one layer's `mlp.down`). It then writes a closed-form rank-one change, ΔW = δ ⊗ C⁻¹k / (kᵀC⁻¹k), as in ROME/MEMIT, one target token at a time.
+  - δ follows the target's loss gradient at that layer's output, so later layers are accounted for. Its size is the smallest that reaches the goal probability.
+  - C comes from the keys of the texts to preserve, and every key already edited is protected from the edits that follow.
+  - `wireNeuron` is the one-neuron version: the neuron's input weights become the network's own representation of the context, and its output points at the token. It is easy to read back with `inspect_neuron` and easy to remove.
+  - Both work best on a pretrained network. A random seed has little to read.
 
 - **Model.** A Llama-style decoder (RMSNorm, rotary attention with grouped KV heads, SwiGLU MLP), compatible with Karpathy's [llama2.c](https://github.com/karpathy/llama2.c) checkpoints. Unlike llama2.c, **each layer keeps its own width**, and every query head names the KV head it reads, so heads and neurons can be grafted onto one layer.
 - **Every edit runs on the GPU.** Scatter, fill (seeded Gaussian, identical in WGSL and TypeScript), region copy, statistics, outlier search and row norms are all shaders. Only what the LLM asks to see is read back: statistics, a grid of at most 32×16 values, ranked coordinates, logits.
@@ -86,6 +94,9 @@ await wsp.mutate.microTrain(
   { lr: 3e-3 }
 );
 await wsp.eval.run('Once upon a time', ' there was');
+
+// A computed edit: no training, one rank-one change, other texts protected.
+await wsp.mutate.insertAssociation({ prompt: 'Lily and Tom went to the', target: ' beach', preserve: ['Once upon a time there was a dog.'] });
 
 const harness = new Harness({ wsp, provider: () => new AnthropicProvider({ apiKey }), onEvent: console.log });
 await harness.send('Make the model less likely to name every character Lily.');

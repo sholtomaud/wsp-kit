@@ -236,3 +236,47 @@ test('microTrain on WebGPU learns a small dataset and matches the CPU', async ({
   expect(Math.abs(r.gpu.after - r.cpu.after)).toBeLessThan(0.05);
   expect(r.gpu.generated).toBe(' there');
 });
+
+test('computed edits on WebGPU: capture, probe and rank-one updates match the CPU', async ({ page }) => {
+  const r = await page.evaluate(async () => {
+    const lib = (await import('/src/index.ts' as string)) as typeof import('../src/index.ts');
+    const make = async (backend: any) => {
+      const tok = lib.Tokenizer.byteLevel();
+      const seed = lib.seedModel({ dim: 32, layers: 2, heads: 2, kvHeads: 1, hidden: 48, seqLen: 64, std: 0.2, seed: 7 });
+      return new lib.WSP(new lib.Model(backend, tok, seed.config, seed.weights, 'm'), { store: new lib.MemoryStore(), datasets: new lib.Datasets(new lib.MemoryStore()) });
+    };
+    const gpu = await make(await lib.WebGpuBackend.create());
+    const cpu = await make(new lib.CpuBackend());
+    const diff = (a: Float32Array, b: Float32Array) => {
+      let m = 0;
+      let s = 0;
+      for (let i = 0; i < a.length; i++) {
+        m = Math.max(m, Math.abs(a[i] - b[i]));
+        s = Math.max(s, Math.abs(b[i]));
+      }
+      return m / Math.max(s, 1e-12);
+    };
+    const ids = gpu.model.tokenizer.encode('capital of France:');
+    const seq = { tokens: ids, targets: ids.map((_, i) => (i === ids.length - 1 ? 35 : -1)) };
+    const out: Record<string, number> = {};
+    const [gt, ct] = [gpu, cpu].map((w) => w.backend.createTrainer(w.config, 32, [], { probeLayer: 1 }));
+    const [gc, cc] = [await gt.capture(seq, 1), await ct.capture(seq, 1)];
+    out.key = diff(gc.key, cc.key);
+    out.mlpInput = diff(gc.mlpInput, cc.mlpInput);
+    out.residual = diff(gc.residual, cc.residual);
+    await gt.accumulate([seq]);
+    await ct.accumulate([seq]);
+    out.probe = diff((await gt.probe()).slice(0, ids.length * 32), (await ct.probe()).slice(0, ids.length * 32));
+    const a = Float32Array.from({ length: 32 }, (_, i) => Math.sin(i));
+    const b = Float32Array.from({ length: 48 }, (_, i) => Math.cos(i));
+    await gpu.backend.addOuter('layer_0.mlp.down', a, b, 0.3);
+    await cpu.backend.addOuter('layer_0.mlp.down', a, b, 0.3);
+    out.addOuter = diff(await gpu.backend.read('layer_0.mlp.down'), await cpu.backend.read('layer_0.mlp.down'));
+    const edit = await gpu.mutate.insertAssociation({ prompt: 'capital of France:', target: ' Paris', layer: 1, goal: 0.35 });
+    const gen = await gpu.eval.run('capital of France:', undefined, { maxTokens: 6 });
+    return { out, reached: edit.reachedGoal, generated: gen.generated };
+  });
+  for (const [k, v] of Object.entries(r.out)) expect(v, k).toBeLessThan(1e-3);
+  expect(r.reached).toBe(true);
+  expect(r.generated).toBe(' Paris');
+});

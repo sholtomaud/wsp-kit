@@ -4,7 +4,7 @@
  * The WebGPU trainer is checked against it, and it is checked against finite
  * differences.
  */
-import type { AdamOptions, Sequence, TrainTarget, Trainer } from '../backend.ts';
+import type { AdamOptions, Sequence, TrainTarget, Trainer, TrainerOptions } from '../backend.ts';
 import { classifierName, kvDim, type ModelConfig } from '../model/types.ts';
 import type { CpuBackend } from './backend.ts';
 
@@ -116,12 +116,16 @@ export class CpuTrainer implements Trainer {
   private m = new Map<string, Vec>();
   private v = new Map<string, Vec>();
   private t = 0;
+  private readonly probeLayer?: number;
+  private lastProbe?: Vec;
 
-  constructor(be: CpuBackend, c: ModelConfig, length: number, targets: TrainTarget[]) {
+  constructor(be: CpuBackend, c: ModelConfig, length: number, targets: TrainTarget[], options: TrainerOptions = {}) {
     this.be = be;
     this.c = c;
     this.length = length;
     this.targets = targets;
+    this.probeLayer = options.probeLayer;
+    if (this.probeLayer !== undefined && !(this.probeLayer >= 0 && this.probeLayer < c.layers.length)) throw new RangeError(`No layer ${this.probeLayer}`);
     for (const { name } of targets) {
       const n = be.data(name).length;
       if (!this.grads.has(name)) {
@@ -241,7 +245,7 @@ export class CpuTrainer implements Trainer {
 
   /** The lowest layer the backward pass must reach, or -1 to reach the embeddings. */
   private lowestLayer(): number {
-    let lowest = this.c.layers.length;
+    let lowest = this.probeLayer ?? this.c.layers.length;
     for (const { name } of this.targets) {
       if (name === 'tok_embeddings') return -1;
       const m = /^layer_(\d+)\./.exec(name);
@@ -284,6 +288,7 @@ export class CpuTrainer implements Trainer {
       const L = f.layers[l];
       const p = `layer_${l}`;
       const qd = layer.nHeads * hs;
+      if (l === this.probeLayer) this.lastProbe = Float64Array.from(dX);
       // MLP: Xout = Xmid + down · H
       if (layer.hidden) {
         const dH = new Float64Array(T * layer.hidden);
@@ -361,6 +366,20 @@ export class CpuTrainer implements Trainer {
       });
     }
     dX = new Float64Array(0);
+  }
+
+  async capture(seq: Sequence, layer: number) {
+    if (!(layer >= 0 && layer < this.c.layers.length)) throw new RangeError(`No layer ${layer}`);
+    const f = this.forward(seq, 0, false);
+    const L = f.layers[layer];
+    const residual = layer + 1 < this.c.layers.length ? f.layers[layer + 1].X : f.Xfinal;
+    return { key: Float32Array.from(L.H), mlpInput: Float32Array.from(L.XN2), residual: Float32Array.from(residual) };
+  }
+
+  async probe() {
+    if (this.probeLayer === undefined) throw new Error('This trainer has no probe layer');
+    if (!this.lastProbe) throw new Error('Run accumulate() first');
+    return Float32Array.from(this.lastProbe);
   }
 
   async gradients() {

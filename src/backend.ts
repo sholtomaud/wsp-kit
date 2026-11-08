@@ -101,7 +101,20 @@ export interface Trainer {
   gradients(): Promise<Map<string, Float32Array>>;
   /** One AdamW step on the trainable regions. Skipped when a gradient is not finite. */
   update(options: AdamOptions): Promise<{ gradNorm: number; skipped: boolean }>;
+  /**
+   * Runs one window forward and returns layer `layer`'s activations, each row-major
+   * [tokens, width]: the MLP key (input to mlp.down), the normalized MLP input
+   * (what mlp.gate and mlp.up read), and the residual stream after the layer.
+   */
+  capture(sequence: Sequence, layer: number): Promise<{ key: Float32Array; mlpInput: Float32Array; residual: Float32Array }>;
+  /** After accumulate(): dLoss/d(output of the probe layer), [tokens, dim]. Needs the probeLayer option. */
+  probe(): Promise<Float32Array>;
   destroy(): void;
+}
+
+export interface TrainerOptions {
+  /** Keep the gradient at this layer's output (for computed edits). */
+  probeLayer?: number;
 }
 
 export interface Backend {
@@ -134,7 +147,9 @@ export interface Backend {
   fill(name: string, region: Region, fill: Fill): Promise<void>;
   createRunner(config: ModelConfig): Runner;
   /** A trainer over windows of `length` tokens; with no targets it only evaluates losses. */
-  createTrainer(config: ModelConfig, length: number, targets: TrainTarget[]): Trainer;
+  createTrainer(config: ModelConfig, length: number, targets: TrainTarget[], options?: TrainerOptions): Trainer;
+  /** W += scale · a ⊗ b (a rank-one update; a has one entry per row, b one per column). */
+  addOuter(name: string, a: Float32Array, b: Float32Array, scale: number): Promise<void>;
   /** Resolves when all queued work has finished. */
   flush(): Promise<void>;
   /** Releases every tensor (and the GPU device). */
