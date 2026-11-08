@@ -64,6 +64,46 @@ export interface Runner {
   destroy(): void;
 }
 
+/** A tensor, or a block of one, that training may change. */
+export interface TrainTarget {
+  name: string;
+  region: Region;
+}
+
+export interface AdamOptions {
+  lr: number;
+  beta1: number;
+  beta2: number;
+  eps: number;
+  weightDecay: number;
+  /** Global gradient-norm clip. */
+  clip: number;
+}
+
+/** One training window: input tokens and next-token targets (-1 = not scored), equal length. */
+export interface Sequence {
+  tokens: number[];
+  targets: number[];
+}
+
+/**
+ * Batched forward and backward passes over fixed-length windows, with AdamW
+ * updates confined to the trainable regions. Everything else stays frozen.
+ */
+export interface Trainer {
+  /** Window length every sequence is padded to. */
+  readonly length: number;
+  /** Summed NLL and scored-token count, forward only. */
+  loss(sequences: Sequence[]): Promise<{ sum: number; count: number }>;
+  /** Zeroes the gradients, then runs forward and backward over the batch (loss = mean over its scored tokens). */
+  accumulate(sequences: Sequence[]): Promise<{ sum: number; count: number }>;
+  /** The accumulated gradients of the trainable tensors (whole tensors). */
+  gradients(): Promise<Map<string, Float32Array>>;
+  /** One AdamW step on the trainable regions. Skipped when a gradient is not finite. */
+  update(options: AdamOptions): Promise<{ gradNorm: number; skipped: boolean }>;
+  destroy(): void;
+}
+
 export interface Backend {
   readonly kind: 'webgpu' | 'cpu';
   readonly description: string;
@@ -93,6 +133,8 @@ export interface Backend {
   scatter(name: string, indices: Uint32Array, values: Float32Array, mode: 'set' | 'add'): Promise<void>;
   fill(name: string, region: Region, fill: Fill): Promise<void>;
   createRunner(config: ModelConfig): Runner;
+  /** A trainer over windows of `length` tokens; with no targets it only evaluates losses. */
+  createTrainer(config: ModelConfig, length: number, targets: TrainTarget[]): Trainer;
   /** Resolves when all queued work has finished. */
   flush(): Promise<void>;
   /** Releases every tensor (and the GPU device). */

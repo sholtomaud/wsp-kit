@@ -7,12 +7,17 @@
  * Patterned on fluxkit's engine (tsrs-monaco/packages/fluxkit), without
  * depending on it.
  */
-import { checkRegion, type Backend, type Fill, type Hits, type Region, type RunOptions, type Runner, type Stats } from '../backend.ts';
+import { checkRegion, type Backend, type TrainTarget, type Fill, type Hits, type Region, type RunOptions, type Runner, type Stats } from '../backend.ts';
 import { classifierName, kvDim, type ModelConfig, type Shape } from '../model/types.ts';
-import { KERNELS, type KernelName } from './kernels.ts';
+import { KERNELS, type KernelName as BaseKernelName } from './kernels.ts';
+import { TRAIN_KERNELS, type TrainKernelName } from './train-kernels.ts';
+import { GpuTrainer } from './trainer.ts';
+
+export type KernelName = BaseKernelName | TrainKernelName;
+const ALL_KERNELS: Record<KernelName, string> = { ...KERNELS, ...TRAIN_KERNELS };
 
 // Flag values from the WebGPU spec (TypeScript's DOM lib lacks the namespaces).
-const U = { MAP_READ: 0x1, COPY_SRC: 0x4, COPY_DST: 0x8, UNIFORM: 0x40, STORAGE: 0x80 } as const;
+export const U = { MAP_READ: 0x1, COPY_SRC: 0x4, COPY_DST: 0x8, UNIFORM: 0x40, STORAGE: 0x80 } as const;
 const MAP_READ = 0x1;
 const TENSOR_USAGE = U.STORAGE | U.COPY_SRC | U.COPY_DST;
 
@@ -25,9 +30,10 @@ export class WgslError extends Error {
   }
 }
 
-type Param = ['u' | 'i' | 'f', number];
+export type Param = ['u' | 'i' | 'f', number];
+export type Binding = GPUBuffer | { buffer: GPUBuffer; offset: number; size: number };
 
-function packUniform(params: Param[]): ArrayBuffer {
+export function packUniform(params: Param[]): ArrayBuffer {
   const buffer = new ArrayBuffer(Math.max(16, Math.ceil(params.length / 4) * 16));
   const view = new DataView(buffer);
   params.forEach(([type, v], i) => {
@@ -39,7 +45,7 @@ function packUniform(params: Param[]): ArrayBuffer {
 }
 
 /** A 2D grid of 64-thread workgroups covering n threads. */
-function grid(n: number): { x: number; y: number; strideX: number } {
+export function grid(n: number): { x: number; y: number; strideX: number } {
   const groups = Math.max(1, Math.ceil(n / 64));
   const x = Math.min(groups, 65535);
   return { x, y: Math.ceil(groups / x), strideX: x * 64 };
@@ -94,8 +100,8 @@ export class WebGpuBackend implements Backend {
 
   /** Compiles every kernel up front, so a WGSL error surfaces at start-up. */
   async compileAll() {
-    for (const name of Object.keys(KERNELS) as KernelName[]) {
-      const code = KERNELS[name];
+    for (const name of Object.keys(ALL_KERNELS) as KernelName[]) {
+      const code = ALL_KERNELS[name];
       const module = this.device.createShaderModule({ label: name, code });
       const info = await module.getCompilationInfo();
       const errors = info.messages.filter((m) => m.type === 'error');
@@ -155,10 +161,11 @@ export class WebGpuBackend implements Backend {
     return buffer;
   }
 
-  bindGroup(kernel: KernelName, buffers: GPUBuffer[]): GPUBindGroup {
+  bindGroup(kernel: KernelName, buffers: Binding[]): GPUBindGroup {
     return this.device.createBindGroup({
+      label: kernel,
       layout: this.pipeline(kernel).getBindGroupLayout(0),
-      entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer } })),
+      entries: buffers.map((b, binding) => ({ binding, resource: 'offset' in b ? b : { buffer: b } })),
     });
   }
 
@@ -367,6 +374,10 @@ export class WebGpuBackend implements Backend {
 
   createRunner(config: ModelConfig): Runner {
     return new GpuRunner(this, config);
+  }
+
+  createTrainer(config: ModelConfig, length: number, targets: TrainTarget[]) {
+    return new GpuTrainer(this, config, length, targets);
   }
 }
 

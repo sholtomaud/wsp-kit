@@ -3,6 +3,7 @@ import { seedModel, type SeedOptions } from '../src/model/formats.ts';
 import { Model } from '../src/model/model.ts';
 import { Tokenizer } from '../src/model/tokenizer.ts';
 import { MemoryStore } from '../src/state/store.ts';
+import { Datasets } from '../src/state/datasets.ts';
 import { WSP } from '../src/wsp.ts';
 
 /** A tiny vocabulary with a few merges, enough to exercise BPE. */
@@ -19,7 +20,7 @@ export function makeWsp(seed: SeedOptions = {}) {
   const { config, weights } = seedModel({ dim: 16, layers: 2, heads: 2, kvHeads: 1, hidden: 24, seqLen: 64, std: 0.2, seed: 7, ...seed });
   const tokenizer = Tokenizer.byteLevel();
   const model = new Model(new CpuBackend(), tokenizer, { ...config, vocabSize: tokenizer.vocabSize }, weights, 'test-seed');
-  return new WSP(model, { store: new MemoryStore() });
+  return new WSP(model, { store: new MemoryStore(), datasets: new Datasets(new MemoryStore()) });
 }
 
 export function maxAbsDiff(a: ArrayLike<number>, b: ArrayLike<number>) {

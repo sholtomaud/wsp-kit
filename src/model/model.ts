@@ -2,7 +2,7 @@
  * A loaded network: its shape, its tensors (in a backend), its tokenizer, and
  * a forward pass that is rebuilt whenever the shape changes.
  */
-import type { Backend, Runner } from '../backend.ts';
+import type { Backend, Runner, Trainer } from '../backend.ts';
 import { rng } from './random.ts';
 import { BOS, EOS, type Tokenizer } from './tokenizer.ts';
 import { checkWeights, type Weights } from './formats.ts';
@@ -23,6 +23,8 @@ export class Model {
   readonly id: string;
   private _config: ModelConfig;
   private runner?: Runner;
+  /** Loss-only batched forward passes, by window length (WebGPU). */
+  private scorers = new Map<number, Trainer>();
 
   constructor(backend: Backend, tokenizer: Tokenizer, config: ModelConfig, weights: Weights, id: string) {
     if (tokenizer.vocabSize !== config.vocabSize) {
@@ -60,6 +62,8 @@ export class Model {
   invalidate() {
     this.runner?.destroy();
     this.runner = undefined;
+    for (const t of this.scorers.values()) t.destroy();
+    this.scorers.clear();
   }
 
   forward(): Runner {
@@ -96,6 +100,14 @@ export class Model {
     if (all.length < 2) return { loss: NaN, tokens: 0 };
     const inputs = all.slice(0, -1);
     const targets = inputs.map((_, i) => (i + 1 >= context.length ? all[i + 1] : -1));
+    if (this.backend.kind === 'webgpu' && inputs.length <= 256) {
+      // One batched forward pass instead of a submit per token.
+      const length = Math.min(this._config.seqLen, Math.ceil(inputs.length / 32) * 32);
+      let scorer = this.scorers.get(length);
+      if (!scorer) this.scorers.set(length, (scorer = this.backend.createTrainer(this._config, length, [])));
+      const r = await scorer.loss([{ tokens: inputs, targets }]);
+      return { loss: r.count ? r.sum / r.count : NaN, tokens: r.count };
+    }
     const { nll } = await this.forward().run(inputs, 0, { targets });
     return { loss: nll!.count ? nll!.sum / nll!.count : NaN, tokens: nll!.count };
   }

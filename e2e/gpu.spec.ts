@@ -112,7 +112,7 @@ test('WSP on WebGPU: graft, prune, micro-train and OPFS checkpoints', async ({ p
     const afterGraft = await logits();
     const graftDiff = Math.max(...afterGraft.map((v, i) => Math.abs(v - base[i])));
     const prune = await wsp.mutate.pruneSemantic(['zzzz zzzz zzzz'], 1.5, { contrastDataset: ['the cat sat'], maxNeurons: 4 });
-    const train = await wsp.mutate.microTrain('norm', ['aaaa aaaa'], 20, { sigma: 0.5, seed: 3 });
+    const train = await wsp.mutate.microTrain('norm', ['aaaa aaaa'], 20, { lr: 0.01, seed: 3 });
     const shapeBefore = wsp.config.layers.map((l) => [l.nHeads, l.hidden]);
     await wsp.state.restore('base');
     const restored = await logits();
@@ -142,4 +142,97 @@ test('WSP on WebGPU: graft, prune, micro-train and OPFS checkpoints', async ({ p
   expect(r.restoreDiff).toBe(0);
   expect(r.list).toEqual(['base']);
   expect(typeof r.anomalies).toBe('number');
+});
+
+test('backprop on WebGPU matches the CPU reference for every tensor', async ({ page }) => {
+  const r = await page.evaluate(async () => {
+    const lib = (await import('/src/index.ts' as string)) as typeof import('../src/index.ts');
+    // GQA, a tied classifier, and a second layer with its own widths (as after grafts).
+    const seed = lib.seedModel({ dim: 32, layers: 2, heads: 4, kvHeads: 2, hidden: 24, seqLen: 64, std: 0.3, seed: 8 });
+    seed.config.layers[1] = { nHeads: 3, headKv: [1, 0, 1], hidden: 13 };
+    for (const s of lib.tensorSpecs(seed.config)) {
+      if (!s.name.startsWith('layer_1.')) continue;
+      const n = s.shape[0] * s.shape[1];
+      seed.weights.set(s.name, Float32Array.from({ length: n }, (_, i) => (s.name.endsWith('norm') ? 1 + 0.1 * Math.sin(i) : 0.3 * Math.sin(i * 1.3 + n))));
+    }
+    const tok = lib.Tokenizer.byteLevel();
+    const gpu = new lib.Model(await lib.WebGpuBackend.create(), tok, seed.config, seed.weights, 'm');
+    const cpu = new lib.Model(new lib.CpuBackend(), tok, seed.config, seed.weights, 'm');
+    const win = (text: string) => {
+      const ids = tok.encode(text, { eos: true });
+      return { tokens: ids.slice(0, -1), targets: ids.slice(1) };
+    };
+    const seqs = [win('Hello, gradient!'), win('short'), win('WebGPU backprop test, a longer window here.')];
+    const targets = gpu.specs().map((s) => ({ name: s.name, region: lib.fullRegion(s.shape) }));
+    const gt = gpu.backend.createTrainer(gpu.config, 48, targets);
+    const ct = cpu.backend.createTrainer(cpu.config, 48, targets);
+    const gl = await gt.accumulate(seqs);
+    const cl = await ct.accumulate(seqs);
+    const gg = await gt.gradients();
+    const cg = await ct.gradients();
+    const worst: Record<string, number> = {};
+    for (const [name, c] of cg) {
+      const g = gg.get(name)!;
+      let num = 0;
+      let den = 0;
+      for (let i = 0; i < c.length; i++) {
+        num += (g[i] - c[i]) ** 2;
+        den += c[i] ** 2;
+      }
+      worst[name] = Math.sqrt(num / Math.max(den, 1e-30));
+    }
+    // Scorer (batched) vs decode-path NLL on the GPU.
+    const ids = tok.encode('The quick brown fox jumps');
+    const decode = await gpu.forward().run(ids.slice(0, -1), 0, { targets: ids.slice(1) });
+    const batched = await gpu.nll(ids.slice(0, 1), ids.slice(1));
+    // One AdamW step on a block changes only that block.
+    const region = { rowStart: 1, rowEnd: 4, colStart: 2, colEnd: 7 };
+    const blockTrainer = gpu.backend.createTrainer(gpu.config, 48, [{ name: 'layer_1.mlp.down', region }]);
+    const before = await gpu.backend.read('layer_1.mlp.down');
+    await blockTrainer.accumulate(seqs);
+    const u = await blockTrainer.update({ lr: 0.01, beta1: 0.9, beta2: 0.95, eps: 1e-8, weightDecay: 0, clip: 1 });
+    const after = await gpu.backend.read('layer_1.mlp.down');
+    let outside = 0;
+    let inside = 0;
+    for (let i = 0; i < after.length; i++) {
+      const row = Math.floor(i / 13);
+      const col = i % 13;
+      const isIn = row >= 1 && row < 4 && col >= 2 && col < 7;
+      if (after[i] !== before[i]) {
+        if (isIn) inside++;
+        else outside++;
+      }
+    }
+    return { gl, cl, worst, decode: decode.nll!.sum / decode.nll!.count, batched: batched.loss, inside, outside, gradNorm: u.gradNorm };
+  });
+  expect(r.gl.count).toBe(r.cl.count);
+  expect(Math.abs(r.gl.sum - r.cl.sum) / r.cl.sum).toBeLessThan(1e-4);
+  for (const [name, err] of Object.entries(r.worst)) expect(err, name).toBeLessThan(1e-3);
+  expect(Object.keys(r.worst)).toHaveLength(1 + 9 * 2 + 1);
+  expect(Math.abs(r.batched - r.decode)).toBeLessThan(1e-4);
+  expect(r.inside).toBe(15);
+  expect(r.outside).toBe(0);
+  expect(r.gradNorm).toBeGreaterThan(0);
+});
+
+test('microTrain on WebGPU learns a small dataset and matches the CPU', async ({ page }) => {
+  const r = await page.evaluate(async () => {
+    const lib = (await import('/src/index.ts' as string)) as typeof import('../src/index.ts');
+    const run = async (backend: any) => {
+      const tok = lib.Tokenizer.byteLevel();
+      const seed = lib.seedModel({ dim: 32, layers: 1, heads: 2, kvHeads: 1, hidden: 32, seqLen: 64, std: 0.1, seed: 4 });
+      const wsp = new lib.WSP(new lib.Model(backend, tok, seed.config, seed.weights, 'm'), {
+        store: new lib.MemoryStore(),
+        datasets: new lib.Datasets(new lib.MemoryStore()),
+      });
+      const r = await wsp.mutate.microTrain('all', ['hi there', 'hi there'], 60, { lr: 0.02, batchSize: 2, seed: 1 });
+      const g = await wsp.eval.run('hi', ' there', { maxTokens: 6 });
+      return { before: r.lossBefore, after: r.lossAfter, generated: g.generated };
+    };
+    return { gpu: await run(await lib.WebGpuBackend.create()), cpu: await run(new lib.CpuBackend()) };
+  });
+  expect(r.gpu.after).toBeLessThan(r.gpu.before / 3);
+  expect(Math.abs(r.gpu.before - r.cpu.before)).toBeLessThan(1e-3);
+  expect(Math.abs(r.gpu.after - r.cpu.after)).toBeLessThan(0.05);
+  expect(r.gpu.generated).toBe(' there');
 });
