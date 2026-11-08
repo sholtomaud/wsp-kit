@@ -5,7 +5,7 @@
  * Activations stay in VRAM; only the summed loss and the gradient norm
  * (for clipping) are read back each step.
  */
-import type { AdamOptions, Sequence, TrainTarget, Trainer } from '../backend.ts';
+import type { AdamOptions, Sequence, TrainTarget, Trainer, TrainerOptions } from '../backend.ts';
 import { classifierName, kvDim, type ModelConfig } from '../model/types.ts';
 import { grid, U, type Binding, type KernelName, type Param, type WebGpuBackend } from './backend.ts';
 
@@ -43,8 +43,12 @@ export class GpuTrainer implements Trainer {
   private lossAcc: GPUBuffer;
   private partials?: GPUBuffer;
   private step = 0;
+  private captures: { key: GPUBuffer; mlpInput: GPUBuffer; residual: GPUBuffer }[] = [];
+  private probeBuf?: GPUBuffer;
 
-  constructor(be: WebGpuBackend, c: ModelConfig, length: number, targets: TrainTarget[]) {
+  constructor(be: WebGpuBackend, c: ModelConfig, length: number, targets: TrainTarget[], options: TrainerOptions = {}) {
+    const probeLayer = options.probeLayer;
+    if (probeLayer !== undefined && !(probeLayer >= 0 && probeLayer < c.layers.length)) throw new RangeError(`No layer ${probeLayer}`);
     if (!(Number.isInteger(length) && length >= 1 && length <= c.seqLen)) throw new RangeError(`Window length must be 1…${c.seqLen}`);
     this.be = be;
     this.c = c;
@@ -167,6 +171,7 @@ export class GpuTrainer implements Trainer {
         linear(F, s.H, w(`${p}.mlp.down`), Xout, layer.hidden, dim, true);
       }
     });
+    this.captures = saved.map((sv, l) => ({ key: sv.H, mlpInput: sv.XN2, residual: xs[l + 1] }));
     const XL = xs[xs.length - 1];
     const XF = f32(T * dim, 'xf');
     const rstdF = f32(T, 'rstdf');
@@ -177,7 +182,7 @@ export class GpuTrainer implements Trainer {
     add(this.forwardList, 'tCrossEntropy', [uni([['u', c.vocabSize]]), this.seq, this.goals, logits, this.lossAcc], T);
 
     // ---- backward (logits now hold dLoss/dlogits)
-    if (this.trainables.size) {
+    if (this.trainables.size || probeLayer !== undefined) {
       const B = this.backwardList;
       const maxQ = Math.max(1, ...c.layers.map((l) => l.nHeads * hs));
       const maxHidden = Math.max(1, ...c.layers.map((l) => l.hidden));
@@ -197,12 +202,14 @@ export class GpuTrainer implements Trainer {
       const dCls = grad(clsName);
       if (dCls) linearBackW(B, logits, XF, dCls, dim, c.vocabSize);
       rmsB(B, dXF, XL, w('norm'), rstdF, dX, false, grad('norm'));
-      const lowest = lowestLayer(c, targets);
+      const lowest = Math.min(lowestLayer(c, targets), probeLayer ?? Infinity);
+      if (probeLayer !== undefined) this.probeBuf = f32(T * dim, 'probe');
       for (let l = c.layers.length - 1; l >= Math.max(0, lowest); l--) {
         const layer = c.layers[l];
         const s = saved[l];
         const p = `layer_${l}`;
         const qd = layer.nHeads * hs;
+        if (l === probeLayer) elementwise(B, 'tCopy', T * dim, [['u', T * dim]], [dX, this.probeBuf!]);
         if (layer.hidden) {
           linearBackX(B, dX, w(`${p}.mlp.down`), dH, layer.hidden, dim, false);
           const dDown = grad(`${p}.mlp.down`);
@@ -248,7 +255,7 @@ export class GpuTrainer implements Trainer {
       if (dEmb && lowest < 0) add(B, 'tEmbB', [uni([['u', T], ['u', dim]]), this.tokens, dX, dEmb], Math.ceil(dim / 64));
 
       // ---- gradient norm (partial sums per tensor) and AdamW
-      this.partials = f32((this.trainables.size * STATS_SLOT) / 4, 'grad-norm partials');
+      if (this.trainables.size) this.partials = f32((this.trainables.size * STATS_SLOT) / 4, 'grad-norm partials');
       [...this.trainables.values()].forEach((t, k) => {
         add(this.statsList, 'stats', [uni([['u', t.size]]), t.grad, { buffer: this.partials!, offset: k * STATS_SLOT, size: STATS_SLOT }], Math.max(1, Math.min(256, Math.ceil(t.size / 256))));
         const r = t.target.region;
@@ -325,6 +332,26 @@ export class GpuTrainer implements Trainer {
       this.be.device.queue.submit([this.encode([this.forwardList, this.backwardList]).finish()]);
     }
     return { sum: await this.readLoss(), count: total };
+  }
+
+  async capture(seq: Sequence, layer: number) {
+    const cap = this.captures[layer];
+    if (!cap) throw new RangeError(`No layer ${layer}`);
+    this.writeWindow(seq, 0);
+    this.be.device.queue.submit([this.encode([this.forwardList]).finish()]);
+    const T = seq.tokens.length;
+    const hidden = this.c.layers[layer].hidden;
+    const dim = this.c.dim;
+    return {
+      key: new Float32Array(await this.be.readBuffer(cap.key, 0, T * hidden * 4)),
+      mlpInput: new Float32Array(await this.be.readBuffer(cap.mlpInput, 0, T * dim * 4)),
+      residual: new Float32Array(await this.be.readBuffer(cap.residual, 0, T * dim * 4)),
+    };
+  }
+
+  async probe() {
+    if (!this.probeBuf) throw new Error('This trainer has no probe layer');
+    return new Float32Array(await this.be.readBuffer(this.probeBuf, 0, this.length * this.c.dim * 4));
   }
 
   async gradients() {

@@ -7,7 +7,7 @@
  * Patterned on fluxkit's engine (tsrs-monaco/packages/fluxkit), without
  * depending on it.
  */
-import { checkRegion, type Backend, type TrainTarget, type Fill, type Hits, type Region, type RunOptions, type Runner, type Stats } from '../backend.ts';
+import { checkRegion, type Backend, type TrainTarget, type TrainerOptions, type Fill, type Hits, type Region, type RunOptions, type Runner, type Stats } from '../backend.ts';
 import { classifierName, kvDim, type ModelConfig, type Shape } from '../model/types.ts';
 import { KERNELS, type KernelName as BaseKernelName } from './kernels.ts';
 import { TRAIN_KERNELS, type TrainKernelName } from './train-kernels.ts';
@@ -376,8 +376,20 @@ export class WebGpuBackend implements Backend {
     return new GpuRunner(this, config);
   }
 
-  createTrainer(config: ModelConfig, length: number, targets: TrainTarget[]) {
-    return new GpuTrainer(this, config, length, targets);
+  createTrainer(config: ModelConfig, length: number, targets: TrainTarget[], options?: TrainerOptions) {
+    return new GpuTrainer(this, config, length, targets, options);
+  }
+
+  async addOuter(name: string, a: Float32Array, b: Float32Array, scale: number) {
+    const t = this.get(name);
+    const [rows, cols] = t.shape;
+    if (a.length !== rows || b.length !== cols) throw new Error(`${name}: outer product of ${a.length}×${b.length} for a ${rows}×${cols} tensor`);
+    if (!rows || !cols) return;
+    const g = grid(rows * cols);
+    const params = this.uniform([['u', rows], ['u', cols], ['u', g.strideX], ['f', scale]]);
+    const av = this.storage(a, 'outer-a');
+    const bv = this.storage(b, 'outer-b');
+    this.dispatch('addOuter', [params, av, bv, t.buffer], g, [params, av, bv]);
   }
 }
 

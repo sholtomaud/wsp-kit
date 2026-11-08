@@ -10,6 +10,7 @@ import { parseWspk, serializeWspk } from './model/formats.ts';
 import { Model } from './model/model.ts';
 import { checkId, defaultStore, type CheckpointStore } from './state/store.ts';
 import { Datasets } from './state/datasets.ts';
+import { insertAssociation, wireNeuron, type AssociationOptions, type WireOptions } from './computed.ts';
 import { rng } from './model/random.ts';
 import { classifierName, cloneConfig, parameterCount, type ModelConfig } from './model/types.ts';
 
@@ -326,6 +327,16 @@ export class WSP {
   // ---------------------------------------------------------------- mutate
 
   readonly mutate = {
+    /**
+     * Computed edit: makes `prompt` continue with `target` by a closed-form
+     * rank-one change to one layer's mlp.down (ROME-style), protecting the
+     * preserve texts. No training loop.
+     */
+    insertAssociation: (o: AssociationOptions) => insertAssociation(this, o),
+
+    /** Computed edit: one neuron that fires on the prompt's context and promotes a token. */
+    wireNeuron: (o: WireOptions) => wireNeuron(this, o),
+
     /** Overwrites (or adds to) specific floats: edits are [row, col, value]. */
     patchSparse: async (target: string, edits: Edit[], mode: 'set' | 'add' = 'set') => {
       const [rows, cols] = this.model.spec(target).shape;

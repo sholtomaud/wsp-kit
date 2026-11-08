@@ -129,6 +129,20 @@ fn main(@builtin(global_invocation_id) g: vec3u) {
   }
 }`,
 
+  /** W[i, j] += scale · a[i] · b[j] */
+  addOuter: /* wgsl */ `
+struct P { rows: u32, cols: u32, strideX: u32, scale: f32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> a: array<f32>;
+@group(0) @binding(2) var<storage, read> b: array<f32>;
+@group(0) @binding(3) var<storage, read_write> w: array<f32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) g: vec3u) {
+  let idx = g.y * p.strideX + g.x;
+  if (idx >= p.rows * p.cols) { return; }
+  w[idx] = w[idx] + p.scale * a[idx / p.cols] * b[idx % p.cols];
+}`,
+
   // ---- forward pass ----
 
   embed: /* wgsl */ `

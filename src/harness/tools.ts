@@ -178,6 +178,41 @@ export const TOOLS: ToolDef[] = [
       }),
   },
   {
+    name: 'mutate_insert_association',
+    description:
+      'Computed edit (no training loop): makes the network continue `prompt` with `target`. wsp-kit reads the network\'s own representation (the key) at the end of the prompt in one layer\'s MLP, and writes a closed-form rank-one change to that layer\'s mlp.down so the key produces the target (ROME/MEMIT-style), one token at a time. preserve_texts are texts whose behaviour must not change; their keys are protected. Best on a network that already understands its input (a pretrained starter). Reports per-token probabilities before/after and whether the goal was reached.',
+    mutates: true,
+    input: S.object(
+      {
+        prompt: S.string('The context, e.g. "The capital of France is".'),
+        target: S.string('The continuation, e.g. " Paris" (mind the leading space).'),
+        layer: S.integer('Layer whose MLP holds the association (default: the middle layer).'),
+        preserve_texts: texts('Texts whose behaviour should stay the same.'),
+        goal: S.number('Probability to reach per target token (default 0.9).'),
+      },
+      ['prompt', 'target']
+    ),
+    run: (wsp, i) => wsp.mutate.insertAssociation({ prompt: i.prompt, target: i.target, layer: i.layer, preserve: i.preserve_texts, goal: i.goal }),
+  },
+  {
+    name: 'mutate_wire_neuron',
+    description:
+      'Computed edit, one neuron = one association: sets an MLP neuron\'s gate and up rows to the network\'s own representation at the end of `prompt` (so it fires there), and its mlp.down column toward the next token `token`, with the strength chosen to reach the goal. Omit `neuron` to graft a fresh one. Interpretable and easy to remove (prune or zero that neuron). Reports its activation on the prompt and on preserve_texts (selectivity).',
+    mutates: true,
+    input: S.object(
+      {
+        layer: S.integer(),
+        neuron: S.integer('Existing neuron to rewire; omit to graft a new one.'),
+        prompt: S.string('Context the neuron should respond to (its last token).'),
+        token: S.string('The next token to promote, as text (its first token is used).'),
+        preserve_texts: texts('Texts on which the neuron should stay quiet (reported, not enforced).'),
+        goal: S.number('Probability to reach (default 0.9).'),
+      },
+      ['layer', 'prompt', 'token']
+    ),
+    run: (wsp, i) => wsp.mutate.wireNeuron({ layer: i.layer, neuron: i.neuron, prompt: i.prompt, token: i.token, preserve: i.preserve_texts, goal: i.goal }),
+  },
+  {
     name: 'mutate_micro_train',
     description:
       'The intern: real backpropagation with AdamW in WebGPU, updating ONLY the targets you name; every other weight is frozen. Targets are tensor names, layer prefixes ("layer_1" = all its tensors), "all", or blocks of one tensor via row/col bounds (e.g. new MLP neurons 16–31 of layer 1: mlp.gate rows 16–32, mlp.up rows 16–32, mlp.down cols 16–32). Trains on a saved dataset (dataset_write) or inline texts; each text is a separate example (BOS…EOS), cut into windows. Returns loss before/after, chance-level loss, and a trajectory. Typical: lr 1e-3–1e-2, a few hundred steps; check with eval_run after.',
